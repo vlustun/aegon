@@ -85,6 +85,23 @@ def ask(prompt: str) -> str:
     return input(prompt).strip()
 
 
+def read_multiline(prompt: str) -> str:
+    """Read a possibly multi-line / pasted instruction until EOF (Ctrl-D).
+
+    A single input() captures only one line, so a pasted multi-line block would
+    spill into later prompts. Reading until EOF captures the whole thing.
+    """
+    print(prompt)
+    print("  (enter your instruction — paste is fine — then Ctrl-D on an empty line)")
+    lines: list[str] = []
+    try:
+        while True:
+            lines.append(input())
+    except EOFError:
+        print()  # tidy newline after the Ctrl-D
+    return "\n".join(lines).strip()
+
+
 def choose_project(idea_arg: str) -> tuple[Path, str, bool]:
     """Interactively pick a new or existing project.
 
@@ -112,11 +129,12 @@ def choose_project(idea_arg: str) -> tuple[Path, str, bool]:
                 name = existing[int(pick) - 1]
                 break
             print("   (enter a valid number)")
-        instruction = idea_arg or ask(f"What should we work on in '{name}'? ")
+        instruction = idea_arg or read_multiline(
+            f"What should we work on in '{name}'?")
         return PROJECTS_DIR / name, instruction, False
 
     # new project
-    idea = idea_arg or ask("Describe the app you want to build: ")
+    idea = idea_arg or read_multiline("Describe the app you want to build:")
     suggested = slugify(idea)
     name = ask(f"Project folder name [{suggested}]: ") or suggested
     name = slugify(name)
@@ -277,7 +295,15 @@ async def run(idea_arg: str) -> None:
 
 
 def main() -> None:
-    idea_arg = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
+    args = sys.argv[1:]
+    idea_arg = ""
+    if args and args[0] in ("--file", "-f"):
+        if len(args) < 2:
+            print("usage: harness.py --file <path>")
+            raise SystemExit(1)
+        idea_arg = Path(args[1]).read_text(encoding="utf-8").strip()
+    elif args:
+        idea_arg = " ".join(args)
     asyncio.run(run(idea_arg))
 
 
