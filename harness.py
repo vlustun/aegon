@@ -23,8 +23,8 @@ Run it:
 How it maps to the plan (see PLAN.md)
 -------------------------------------
 - planner    → tools=[]                      (reasoning only, no disk access)
-- scaffolder → tools=["Write","Read","Edit"] (writes/edits files, no shell),
-               cwd = the project folder
+- scaffolder → tools=["Write","Read","Edit","Bash"] (writes/edits files and can
+               run shell, e.g. composer/npm install), cwd = the project folder
 - Between stages, `checkpoint()` pauses for your approval.
 """
 
@@ -41,16 +41,22 @@ from pathlib import Path
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     TextBlock,
     query,
 )
+from claude_agent_sdk._errors import ClaudeSDKError, ResultError
 
 PROJECTS_DIR = Path("projects")
 
 # Keep runs cheap while learning. See PLAN.md for the intended per-role models.
 PLANNER_MODEL = "claude-sonnet-5-5"
 SCAFFOLDER_MODEL = "claude-sonnet-5-5"
+TESTER_MODEL = "claude-sonnet-5-5"
+FIXER_MODEL = "claude-sonnet-5-5"
+MAX_FIX_ATTEMPTS = 3
 
 PLANNER_SYSTEM = (
     "You are a software planning specialist. Given an application idea (and, for "
@@ -69,7 +75,9 @@ SCAFFOLDER_SYSTEM = (
     "You are a scaffolding specialist. Given a build plan, create or update the "
     "files it lists using the Write/Edit tools, with working starter code — real, "
     "runnable code rather than empty placeholders wherever practical. Use relative "
-    "paths (they resolve inside the project folder). For an existing project, first "
+    "paths (they resolve inside the project folder). You can run shell commands "
+    "(e.g. `composer install`, `npm install`, `pip install`) to fetch dependencies "
+    "and verify the project builds. For an existing project, first "
     "Read the relevant files and preserve what's there; add or modify rather than "
     "overwrite wholesale. Keep files small and focused. Ensure a README with run "
     "instructions exists.\n\n"
@@ -79,6 +87,24 @@ SCAFFOLDER_SYSTEM = (
     "change that exact line's '- [ ]' to '- [x]' in progress.md. Only check a task "
     "once its work is genuinely done. Never uncheck an already-checked task.\n\n"
     "When done, report the list of files you created or changed, one per line."
+)
+
+TESTER_SYSTEM = (
+    "You are a test runner. Inspect the project to find its test setup (e.g. "
+    "pytest, phpunit, npm test, go test, cargo test), install dependencies if "
+    "needed, and run the FULL test suite. Do NOT modify any source or test files — "
+    "only run things. Then, as the VERY LAST line of your reply, output exactly "
+    "'RESULT: PASS' if every test passed, or 'RESULT: FAIL' otherwise. Just above "
+    "that line, include the most relevant failing output (or note 'all green' on "
+    "success). If there is no test suite at all, output 'RESULT: NONE'."
+)
+
+FIXER_SYSTEM = (
+    "You are a debugging specialist. You are given failing test output for a "
+    "project. Fix the underlying problem by editing the code with the Edit/Write "
+    "tools. Prefer fixing the source over changing tests; only change a test if it "
+    "is clearly wrong. Keep changes minimal and focused. You may run commands to "
+    "check your work. Briefly report what you changed."
 )
 
 
@@ -151,9 +177,9 @@ def choose_project(idea_arg: str) -> tuple[Path, str, bool]:
                 name = existing[int(pick) - 1]
                 break
             print("   (enter a valid number)")
-        instruction = idea_arg or read_multiline(
-            f"What should we work on in '{name}'?")
-        return PROJECTS_DIR / name, instruction, False
+        # Defer "what should we work on?" to run(): it offers resume first, and
+        # only needs an instruction when a new plan is actually being made.
+        return PROJECTS_DIR / name, idea_arg, False
 
     # new project
     idea = idea_arg or read_multiline("Describe the app you want to build:")
@@ -175,15 +201,35 @@ def choose_project(idea_arg: str) -> tuple[Path, str, bool]:
 
 
 # --- running a single agent -----------------------------------------------
+def _make_bash_confirmer(label: str):
+    """Build a can_use_tool callback that prompts in the terminal before any
+    Bash command runs. Other tools (Write/Read/Edit) are left to the agent's
+    permission_mode, so this only gates shell commands."""
+    async def confirm(tool_name: str, tool_input: dict, context):
+        if tool_name != "Bash":
+            return PermissionResultAllow()
+        cmd = tool_input.get("command", "")
+        print(f"\n⏸  {label} wants to run a shell command:\n    {cmd}")
+        # input() is blocking; run it off the event loop so streaming isn't stalled.
+        ans = (await asyncio.to_thread(ask, "   allow? [y]es / [N]o: ")).lower()
+        if ans in ("y", "yes"):
+            return PermissionResultAllow()
+        return PermissionResultDeny(message="User declined to run this command.")
+    return confirm
+
+
 async def run_agent(
     *, label: str, system: str, prompt: str, tools: list[str],
     model: str, cwd: str | None = None, permission_mode: str = "default",
-    stream_text: bool = True,
+    stream_text: bool = True, max_turns: int = 30, confirm_bash: bool = False,
 ) -> tuple[str, float]:
     """Run one focused sub-agent to completion. Returns (text_output, cost_usd).
 
     stream_text=False collects the output silently (used for the planner, whose
     JSON we render ourselves instead of dumping raw to the terminal).
+
+    confirm_bash=True prompts in the terminal before each Bash command runs
+    (used by the scaffolder, which may run composer/npm/pip to fetch deps).
     """
     options = ClaudeAgentOptions(
         system_prompt=system,
@@ -191,20 +237,34 @@ async def run_agent(
         permission_mode=permission_mode,
         model=model,
         cwd=cwd,
-        max_turns=30,
+        max_turns=max_turns,
+        can_use_tool=_make_bash_confirmer(label) if confirm_bash else None,
     )
     print(f"\n▶ {label}" + ("" if stream_text else " (thinking…)") + "\n" + "─" * 60)
     collected: list[str] = []
     cost = 0.0
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    if stream_text:
-                        print(block.text)
-                    collected.append(block.text)
-        elif isinstance(message, ResultMessage):
-            cost = message.total_cost_usd or 0.0
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        if stream_text:
+                            print(block.text)
+                        collected.append(block.text)
+            elif isinstance(message, ResultMessage):
+                cost = message.total_cost_usd or 0.0
+    except ResultError as e:
+        # A single agent failing (most commonly hitting its max-turns limit)
+        # should not nuke the whole pipeline and throw away work already done.
+        # Keep whatever it produced and let the caller's checkpoints decide.
+        if e.subtype == "error_max_turns":
+            print(f"\n⚠  {label} hit its turn limit ({max_turns}) before finishing — "
+                  "keeping its partial work. Raise max_turns if this recurs.")
+        else:
+            reason = e.terminal_reason or e.subtype or "unknown error"
+            print(f"\n⚠  {label} ended early ({reason}) — keeping its partial work.")
+    except ClaudeSDKError as e:
+        print(f"\n⚠  {label} failed: {e} — keeping any partial work.")
     return "\n".join(collected), cost
 
 
@@ -481,11 +541,74 @@ def checkpoint(question: str, *, allow_revise: bool = False) -> tuple[str, str]:
         print("   (please answer a" + ("/r" if allow_revise else "") + "/q)")
 
 
+# --- test + fix loop -------------------------------------------------------
+def read_result(output: str) -> str | None:
+    """Read the tester's trailing 'RESULT: PASS|FAIL|NONE' marker."""
+    result = None
+    for line in output.splitlines():
+        s = line.strip().upper()
+        if s.startswith("RESULT: PASS"):
+            result = "PASS"
+        elif s.startswith("RESULT: FAIL"):
+            result = "FAIL"
+        elif s.startswith("RESULT: NONE"):
+            result = "NONE"
+    return result
+
+
+async def test_and_fix(project: Path, idea: str) -> tuple[str | None, float]:
+    """Run the test suite and, on failure, loop Tester↔Fixer up to a limit.
+
+    Returns (result, cost) where result is 'PASS', 'FAIL', 'NONE', or None
+    (skipped). Runs shell commands, so it is gated behind a confirmation.
+    """
+    decision, _ = checkpoint(
+        "Run the test suite? (this executes shell commands in the project)")
+    if decision != "approve":
+        print("skipped testing.")
+        return None, 0.0
+
+    total = 0.0
+    for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+        out, cost = await run_agent(
+            label=f"tester (attempt {attempt}/{MAX_FIX_ATTEMPTS})",
+            system=TESTER_SYSTEM,
+            prompt="Run the project's full test suite and end with the RESULT line.",
+            tools=["Bash", "Read"], model=TESTER_MODEL, cwd=str(project),
+            permission_mode="bypassPermissions", max_turns=40,
+        )
+        total += cost
+        result = read_result(out)
+
+        if result == "PASS":
+            print(f"\n✓ tests pass (attempt {attempt}).")
+            return "PASS", total
+        if result == "NONE":
+            print("\nno test suite found — nothing to run.")
+            return "NONE", total
+
+        print(f"\n✗ tests failing (attempt {attempt}).")
+        if attempt == MAX_FIX_ATTEMPTS:
+            break
+        print("   → handing the failures to the fixer…")
+        _, cost = await run_agent(
+            label=f"fixer (attempt {attempt}/{MAX_FIX_ATTEMPTS})",
+            system=FIXER_SYSTEM,
+            prompt=f"App / task: {idea}\n\nFailing test output:\n\n{out}\n\n"
+                   "Fix the code so the tests pass.",
+            tools=["Read", "Edit", "Write", "Bash"], model=FIXER_MODEL,
+            cwd=str(project), permission_mode="bypassPermissions", max_turns=40,
+        )
+        total += cost
+
+    print("\ntests still failing after max attempts — leaving the code to inspect.")
+    return "FAIL", total
+
+
 async def run(idea_arg: str) -> None:
     print("\n🜂  Aegon")
     project, idea, is_new = choose_project(idea_arg)
     kind = "new project" if is_new else "existing project"
-    print(f"\n{kind}: {project}/\n→ task: {idea!r}")
 
     total_cost = 0.0
     progress_md = project / "progress.md"
@@ -498,19 +621,47 @@ async def run(idea_arg: str) -> None:
         print(f"\nfound an existing plan — {done}/{total} tasks done.")
         resume = ask("Resume it or make a new plan? [r]esume / [n]ew: ").lower()[:1] != "n"
 
+    # For an existing project we deferred asking what to work on until after the
+    # resume question: a fresh plan needs an instruction, a resume does not.
+    if not is_new and not resume and not idea:
+        idea = read_multiline(f"What should we work on in '{project.name}'?")
+
+    print(f"\n{kind}: {project}/")
+    if idea:
+        print(f"→ task: {idea!r}")
+
+    # A plan.md you placed in the project folder is treated as YOUR plan: the
+    # planner is skipped and this file is never overwritten. (progress.md, the
+    # harness's working checklist, is derived from it so tasks can be ticked.)
+    user_plan_md = project / "plan.md"
+
     if resume:
         plan = progress_md.read_text(encoding="utf-8")
         print("resuming progress.md (continuing the unchecked tasks)")
+    elif user_plan_md.exists():
+        plan = user_plan_md.read_text(encoding="utf-8")
+        print(f"using your {user_plan_md} as the plan (it will not be overwritten)")
+        if not progress_md.exists():
+            write_progress_md_fallback(plan, project, idea)
+            print(f"   (created {progress_md} to track task progress)")
+        else:
+            print(f"   (keeping existing {progress_md} for progress tracking)")
     else:
         context = "" if is_new else (
             "\nThis is an EXISTING project; read its current files before planning."
         )
+        # For an existing project the planner gets read-only access to the
+        # project folder (cwd = the project) so it plans/answers from the real
+        # files, not guesswork. A new project has nothing to read yet.
+        planner_tools = [] if is_new else ["Read", "Glob", "Grep"]
+        planner_cwd = None if is_new else str(project)
         # --- Stage 1: PLAN (with optional revise loop) ---------------------
         plan_prompt = f"App / task: {idea}{context}"
         while True:
             plan, cost = await run_agent(
                 label="planner", system=PLANNER_SYSTEM, prompt=plan_prompt,
-                tools=[], model=PLANNER_MODEL, stream_text=False,
+                tools=planner_tools, cwd=planner_cwd,
+                model=PLANNER_MODEL, stream_text=False,
             )
             total_cost += cost
             plan_data = parse_plan(plan)
@@ -549,8 +700,9 @@ async def run(idea_arg: str) -> None:
     )
     report, cost = await run_agent(
         label="scaffolder", system=SCAFFOLDER_SYSTEM, prompt=scaffold_prompt,
-        tools=["Write", "Read", "Edit"], model=SCAFFOLDER_MODEL,
-        cwd=str(project), permission_mode="acceptEdits",
+        # Bash is allowlisted, so composer/npm/pip etc. run without prompting.
+        tools=["Write", "Read", "Edit", "Bash"], model=SCAFFOLDER_MODEL,
+        cwd=str(project), permission_mode="acceptEdits", max_turns=80,
     )
     total_cost += cost
 
@@ -561,18 +713,23 @@ async def run(idea_arg: str) -> None:
         if plan_data:
             write_plan_html(plan_data, project, idea, progress_md)
 
-    decision, _ = checkpoint("Scaffold complete. Keep this result?")
+    # --- Stage 3: TEST + FIX ----------------------------------------------
+    test_result, tcost = await test_and_fix(project, idea)
+    total_cost += tcost
+
+    decision, _ = checkpoint("All done. Keep this result?")
     kept = decision == "approve"
 
     # --- Wrap up -----------------------------------------------------------
     (project / "run.json").write_text(
         json.dumps(
             {"idea": idea, "is_new": is_new, "plan": plan,
-             "scaffold_report": report, "kept": kept, "cost_usd": total_cost},
+             "scaffold_report": report, "test_result": test_result,
+             "kept": kept, "cost_usd": total_cost},
             indent=2,
         )
     )
-    # --- Stage 3: PUBLISH (commit + push to the project's repo) ------------
+    # --- Stage 4: PUBLISH (commit + push to the project's repo) ------------
     if kept:
         publish(project, idea)
 
