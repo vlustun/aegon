@@ -29,9 +29,13 @@ How it maps to the plan (see PLAN.md)
 """
 
 import asyncio
+import html
 import json
 import re
+import shutil
+import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 
 from claude_agent_sdk import (
@@ -68,8 +72,13 @@ SCAFFOLDER_SYSTEM = (
     "paths (they resolve inside the project folder). For an existing project, first "
     "Read the relevant files and preserve what's there; add or modify rather than "
     "overwrite wholesale. Keep files small and focused. Ensure a README with run "
-    "instructions exists. When done, report the list of files you created or "
-    "changed, one per line."
+    "instructions exists.\n\n"
+    "PROGRESS TRACKING: the project contains a progress.md whose '## Tasks' "
+    "section lists tasks as checkboxes. Work through the UNCHECKED ('- [ ]') tasks "
+    "in order. Immediately after you actually finish a task, use the Edit tool to "
+    "change that exact line's '- [ ]' to '- [x]' in progress.md. Only check a task "
+    "once its work is genuinely done. Never uncheck an already-checked task.\n\n"
+    "When done, report the list of files you created or changed, one per line."
 )
 
 
@@ -122,7 +131,20 @@ def choose_project(idea_arg: str) -> tuple[Path, str, bool]:
     if mode == "e":
         print("\nExisting projects:")
         for i, name in enumerate(existing, 1):
-            print(f"  {i}) {name}")
+            progress_md = PROJECTS_DIR / name / "progress.md"
+            if not progress_md.exists():
+                status = "no plan"
+            else:
+                done, total = plan_progress(progress_md)
+                if total == 0:
+                    status = "no tasks"
+                elif done == 0:
+                    status = f"0/{total} tasks  (not started)"
+                elif done >= total:
+                    status = f"{done}/{total} tasks  (complete)"
+                else:
+                    status = f"{done}/{total} tasks"
+            print(f"  {i}) {name:<20} {status}")
         while True:
             pick = ask("Pick a number: ")
             if pick.isdigit() and 1 <= int(pick) <= len(existing):
@@ -142,6 +164,13 @@ def choose_project(idea_arg: str) -> tuple[Path, str, bool]:
     if path.exists():
         print(f"(a project named '{name}' already exists — continuing in it)")
     path.mkdir(parents=True, exist_ok=True)
+
+    # Per-project config: which GitHub repo this project pushes to.
+    repo = ask("GitHub repo for this project (git URL, blank to skip): ")
+    cfg = {"branch": "main"}
+    if repo:
+        cfg["github_repo"] = repo
+    save_config(path, cfg)
     return path, idea, True
 
 
@@ -211,6 +240,228 @@ def render_plan(data: dict) -> None:
     print("╰" + "─" * 59)
 
 
+def tasks_from_md(progress_md: Path) -> list[tuple[str, bool]]:
+    """Read tasks and their checked state from progress.md."""
+    tasks = []
+    for line in progress_md.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"\s*- \[([ xX])\]\s+(.*)", line)
+        if m:
+            tasks.append((m.group(2).strip(), m.group(1).lower() == "x"))
+    return tasks
+
+
+def write_plan_html(data: dict, project: Path, idea: str,
+                    progress_md: Path | None = None) -> Path:
+    """Render the plan as a self-contained, styled HTML file with task checkboxes.
+
+    Task checked-state is read from progress.md when available (so the HTML can
+    be refreshed after scaffolding to show progress); otherwise all unchecked.
+    """
+    esc = html.escape
+
+    if progress_md and progress_md.exists():
+        tasks = tasks_from_md(progress_md)
+    else:
+        tasks = [(str(s), False) for s in data.get("steps") or []]
+    done = sum(1 for _, c in tasks if c)
+    total = len(tasks)
+
+    file_rows = ""
+    for f in data.get("files") or []:
+        if isinstance(f, dict):
+            file_rows += (f"<tr><td class='path'>{esc(str(f.get('path', '?')))}</td>"
+                          f"<td>{esc(str(f.get('purpose', '')))}</td></tr>")
+        else:
+            file_rows += f"<tr><td class='path'>{esc(str(f))}</td><td></td></tr>"
+
+    task_items = ""
+    for text, checked in tasks:
+        box = "checked" if checked else ""
+        cls = "done" if checked else ""
+        task_items += (f"<li class='{cls}'><label><input type='checkbox' disabled "
+                       f"{box}> {esc(text)}</label></li>")
+
+    doc = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build Plan</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 16px/1.6 system-ui, sans-serif; max-width: 760px;
+         margin: 2rem auto; padding: 0 16px; }}
+  h1 {{ font-size: 1.4rem; margin-bottom: .2rem; }}
+  .idea {{ color: #888; margin-bottom: 1.5rem; white-space: pre-wrap; }}
+  .k {{ font-weight: 600; }}
+  .prog {{ color: #888; font-size: .9rem; margin-bottom: .3rem; }}
+  table {{ border-collapse: collapse; width: 100%; margin: .5rem 0 1.5rem; }}
+  td {{ padding: 6px 10px; border-bottom: 1px solid #8884; vertical-align: top; }}
+  .path {{ font-family: ui-monospace, monospace; white-space: nowrap; }}
+  ul.tasks {{ list-style: none; padding-left: 0; }}
+  ul.tasks li {{ margin: .3rem 0; }}
+  ul.tasks li.done label {{ color: #888; text-decoration: line-through; }}
+  input[type=checkbox] {{ margin-right: .5rem; }}
+  section {{ margin-bottom: 1.5rem; }}
+</style></head><body>
+<h1>🜂 Build Plan</h1>
+<div class="idea">{esc(idea)}</div>
+<section><span class="k">Summary:</span> {esc(str(data.get('summary', '—')))}</section>
+<section><span class="k">Stack:</span> {esc(str(data.get('stack', '—')))}</section>
+<section><div class="k">Files</div><table>{file_rows}</table></section>
+<section><div class="k">Tasks</div>
+<div class="prog">{done}/{total} done</div>
+<ul class="tasks">{task_items}</ul></section>
+</body></html>"""
+
+    path = project / "plan.html"
+    path.write_text(doc, encoding="utf-8")
+    return path
+
+
+def open_in_browser(path: Path) -> bool:
+    """Best-effort open of a local file in the browser (handles WSL)."""
+    target = str(path.resolve())
+    for opener in ("wslview", "xdg-open"):
+        if shutil.which(opener):
+            try:
+                subprocess.Popen([opener, target],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except OSError:
+                pass
+    try:
+        return webbrowser.open(path.resolve().as_uri())
+    except webbrowser.Error:
+        return False
+
+
+def write_progress_md(data: dict, project: Path, idea: str) -> Path:
+    """Write progress.md with tasks as checkboxes, for live progress + resuming."""
+    idea_line = " ".join(idea.splitlines())
+    lines = ["# Build Plan", "", f"> {idea_line}", "",
+             f"**Stack:** {data.get('stack', '—')}", "", "## Files", ""]
+    for f in data.get("files") or []:
+        if isinstance(f, dict):
+            lines.append(f"- `{f.get('path', '?')}` — {f.get('purpose', '')}")
+        else:
+            lines.append(f"- `{f}`")
+    lines += ["", "## Tasks", ""]
+    for step in data.get("steps") or []:
+        lines.append(f"- [ ] {step}")
+    lines.append("")
+    path = project / "progress.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def extract_tasks(text: str) -> list[str]:
+    """Pull bullet / numbered lines out of free-form text to use as tasks."""
+    tasks = []
+    for line in text.splitlines():
+        m = re.match(r"\s*(?:\d+[.)]|[-*])\s+(.+)", line)
+        if m:
+            tasks.append(m.group(1).strip())
+    return tasks
+
+
+def write_progress_md_fallback(raw: str, project: Path, idea: str) -> Path:
+    """Write progress.md from unparseable planner output, so a run is still
+    resumable. Any bullet/numbered lines become checkboxes."""
+    idea_line = " ".join(idea.splitlines())
+    tasks = extract_tasks(raw) or ["Complete the plan described above"]
+    lines = ["# Build Plan", "", f"> {idea_line}", "", "## Plan", "",
+             raw.strip(), "", "## Tasks", ""]
+    lines += [f"- [ ] {t}" for t in tasks]
+    lines.append("")
+    path = project / "progress.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def plan_progress(plan_md: Path) -> tuple[int, int]:
+    """Count (checked, total) task checkboxes in progress.md."""
+    text = plan_md.read_text(encoding="utf-8")
+    done = len(re.findall(r"- \[x\]", text, flags=re.IGNORECASE))
+    todo = len(re.findall(r"- \[ \]", text))
+    return done, done + todo
+
+
+# --- per-project config + git/github --------------------------------------
+def config_path(project: Path) -> Path:
+    return project / "aegon.json"
+
+
+def load_config(project: Path) -> dict:
+    p = config_path(project)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_config(project: Path, cfg: dict) -> None:
+    config_path(project).write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
+def run_git(args: list[str], cwd: Path) -> tuple[int, str]:
+    """Run a git command in cwd; return (returncode, combined output)."""
+    proc = subprocess.run(["git", *args], cwd=str(cwd),
+                          capture_output=True, text=True)
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def ensure_gitignore(project: Path, entries: list[str]) -> None:
+    """Make sure each entry is present in the project's .gitignore."""
+    gi = project / ".gitignore"
+    existing = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    to_add = [e for e in entries if e not in existing]
+    if to_add:
+        with gi.open("a", encoding="utf-8") as f:
+            if existing and existing[-1].strip():
+                f.write("\n")
+            f.write("\n".join(to_add) + "\n")
+
+
+def publish(project: Path, idea: str) -> None:
+    """Commit the project and push to its configured GitHub repo (if any)."""
+    cfg = load_config(project)
+    repo = cfg.get("github_repo")
+    if not repo:
+        print(f"\nno GitHub repo configured — skipping push.")
+        print(f"   (add \"github_repo\" to {config_path(project)} to enable it)")
+        return
+
+    decision, _ = checkpoint(f"Push this project to {repo} ?")
+    if decision != "approve":
+        print("skipped push.")
+        return
+
+    branch = cfg.get("branch", "main")
+
+    if not (project / ".git").exists():
+        run_git(["init"], project)
+        run_git(["branch", "-M", branch], project)
+
+    # keep harness-only files out of the app's repo
+    ensure_gitignore(project, ["aegon.json", "run.json"])
+
+    # point origin at the configured repo (add or update)
+    rc, _ = run_git(["remote", "get-url", "origin"], project)
+    run_git(["remote", "set-url" if rc == 0 else "add", "origin", repo], project)
+
+    run_git(["add", "-A"], project)
+    default_msg = f"Aegon: build {project.name}"
+    msg = ask(f'Commit message [{default_msg}]: ') or default_msg
+    rc, out = run_git(["commit", "-m", msg], project)
+    if rc != 0 and "nothing to commit" in out:
+        print("nothing new to commit.")
+
+    print(f"pushing to {repo} ({branch})…")
+    rc, out = run_git(["push", "-u", "origin", branch], project)
+    print(f"✓ pushed to {repo} ({branch})." if rc == 0 else f"push failed:\n{out}")
+
+
 # --- the human checkpoint --------------------------------------------------
 def checkpoint(question: str, *, allow_revise: bool = False) -> tuple[str, str]:
     """Ask the user to approve/quit (and optionally revise).
@@ -237,39 +488,64 @@ async def run(idea_arg: str) -> None:
     print(f"\n{kind}: {project}/\n→ task: {idea!r}")
 
     total_cost = 0.0
-    context = "" if is_new else (
-        "\nThis is an EXISTING project; read its current files before planning."
-    )
+    progress_md = project / "progress.md"
+    plan_data: dict | None = None
 
-    # --- Stage 1: PLAN (with optional revise loop) -------------------------
-    plan_prompt = f"App / task: {idea}{context}"
-    while True:
-        plan, cost = await run_agent(
-            label="planner", system=PLANNER_SYSTEM, prompt=plan_prompt,
-            tools=[], model=PLANNER_MODEL, stream_text=False,
+    # --- Resume? existing project with an unfinished progress.md -----------
+    resume = False
+    if not is_new and progress_md.exists() and "- [ ]" in progress_md.read_text(encoding="utf-8"):
+        done, total = plan_progress(progress_md)
+        print(f"\nfound an existing plan — {done}/{total} tasks done.")
+        resume = ask("Resume it or make a new plan? [r]esume / [n]ew: ").lower()[:1] != "n"
+
+    if resume:
+        plan = progress_md.read_text(encoding="utf-8")
+        print("resuming progress.md (continuing the unchecked tasks)")
+    else:
+        context = "" if is_new else (
+            "\nThis is an EXISTING project; read its current files before planning."
         )
-        total_cost += cost
-        plan_data = parse_plan(plan)
-        if plan_data:
-            render_plan(plan_data)
-        else:
-            # Fallback: couldn't parse JSON, just show what the planner returned.
-            print(plan)
-        decision, feedback = checkpoint("Accept this plan?", allow_revise=True)
-        if decision == "quit":
-            print("\naborted at plan stage. no files written.")
-            return
-        if decision == "approve":
-            break
-        plan_prompt = (
-            f"App / task: {idea}{context}\n\nPrevious plan:\n{plan}\n\n"
-            f"Revise the plan per this feedback: {feedback}"
-        )
+        # --- Stage 1: PLAN (with optional revise loop) ---------------------
+        plan_prompt = f"App / task: {idea}{context}"
+        while True:
+            plan, cost = await run_agent(
+                label="planner", system=PLANNER_SYSTEM, prompt=plan_prompt,
+                tools=[], model=PLANNER_MODEL, stream_text=False,
+            )
+            total_cost += cost
+            plan_data = parse_plan(plan)
+            # Write the checkbox progress.md right now, during planning, so it
+            # always exists (structured if the JSON parsed, else from raw text).
+            if plan_data:
+                write_progress_md(plan_data, project, idea)
+                render_plan(plan_data)               # quick glance in the terminal
+                html_path = write_plan_html(plan_data, project, idea, progress_md)
+                opened = open_in_browser(html_path)
+                print(f"\n   plan: {progress_md}  ·  {html_path}"
+                      + ("  (opened)" if opened else ""))
+            else:
+                write_progress_md_fallback(plan, project, idea)
+                print(plan)
+                print(f"\n   plan: {progress_md}")
+            decision, feedback = checkpoint("Accept this plan?", allow_revise=True)
+            if decision == "quit":
+                print("\naborted at plan stage. (progress.md was written)")
+                return
+            if decision == "approve":
+                break
+            plan_prompt = (
+                f"App / task: {idea}{context}\n\nPrevious plan:\n{plan}\n\n"
+                f"Revise the plan per this feedback: {feedback}"
+            )
+
+        # Hand the checkbox file to the scaffolder to tick off.
+        plan = progress_md.read_text(encoding="utf-8")
 
     # --- Stage 2: SCAFFOLD -------------------------------------------------
     scaffold_prompt = (
-        f"App / task: {idea}\n\nApproved build plan:\n{plan}\n\n"
-        "Create or update all the files for this plan now."
+        f"App / task: {idea}\n\nBuild plan (tasks are the checkboxes in progress.md):\n"
+        f"{plan}\n\nWork through the unchecked tasks now, creating or updating the "
+        "files, and tick each task off in progress.md as you complete it."
     )
     report, cost = await run_agent(
         label="scaffolder", system=SCAFFOLDER_SYSTEM, prompt=scaffold_prompt,
@@ -277,6 +553,13 @@ async def run(idea_arg: str) -> None:
         cwd=str(project), permission_mode="acceptEdits",
     )
     total_cost += cost
+
+    if progress_md.exists():
+        done, total = plan_progress(progress_md)
+        print(f"\n   progress: {done}/{total} tasks checked in {progress_md}")
+        # Refresh plan.html so its checkboxes reflect the scaffolder's progress.
+        if plan_data:
+            write_plan_html(plan_data, project, idea, progress_md)
 
     decision, _ = checkpoint("Scaffold complete. Keep this result?")
     kept = decision == "approve"
@@ -289,6 +572,10 @@ async def run(idea_arg: str) -> None:
             indent=2,
         )
     )
+    # --- Stage 3: PUBLISH (commit + push to the project's repo) ------------
+    if kept:
+        publish(project, idea)
+
     print("\n" + "─" * 60)
     print(f"done · ${total_cost:.4f} · project: {project}/"
           + ("" if kept else "  (you marked this run as not kept)"))
