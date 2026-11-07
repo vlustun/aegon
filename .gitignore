@@ -4,3 +4,4 @@ __pycache__/
 runs/
 projects/
 .env
+spec.txt
