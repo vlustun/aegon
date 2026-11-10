@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 from claude_agent_sdk import (
@@ -464,11 +465,62 @@ def save_config(project: Path, cfg: dict) -> None:
     config_path(project).write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
 
+def run_cmd(args: list[str], cwd: Path) -> tuple[int, str]:
+    """Run a command in cwd; return (returncode, combined output)."""
+    proc = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True)
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
 def run_git(args: list[str], cwd: Path) -> tuple[int, str]:
     """Run a git command in cwd; return (returncode, combined output)."""
-    proc = subprocess.run(["git", *args], cwd=str(cwd),
-                          capture_output=True, text=True)
-    return proc.returncode, (proc.stdout + proc.stderr).strip()
+    return run_cmd(["git", *args], cwd)
+
+
+def remote_is_empty(project: Path) -> bool:
+    """True only if 'origin' is reachable and has no branches at all.
+
+    Used to decide a one-time bootstrap: we only push the base branch directly
+    when we can positively confirm the remote is empty. Any error (unreachable,
+    auth) returns False, so we never push to the base branch on a guess.
+    """
+    rc, out = run_git(["ls-remote", "--heads", "origin"], project)
+    return rc == 0 and not out.strip()
+
+
+def parse_github_slug(repo_url: str) -> str | None:
+    """Extract 'owner/repo' from a GitHub git URL (ssh or https), else None."""
+    m = re.search(r"github\.com[:/]+([^/]+/[^/]+?)(?:\.git)?/?$", repo_url.strip())
+    return m.group(1) if m else None
+
+
+def make_branch_name(project: Path, idea: str) -> str:
+    """A unique, readable feature-branch name for this build."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    topic = slugify(idea) if idea else project.name
+    return f"aegon/{topic}-{stamp}"[:60].rstrip("-")
+
+
+def open_pull_request(project: Path, repo: str, base: str, head: str,
+                      title: str, body: str) -> None:
+    """Open a PR (base ← head) via the gh CLI; fall back to a compare URL."""
+    slug = parse_github_slug(repo)
+    if shutil.which("gh"):
+        rc, out = run_cmd(["gh", "pr", "create", "--base", base, "--head", head,
+                           "--title", title, "--body", body], project)
+        if rc == 0:
+            print(f"✓ opened PR: {out.strip().splitlines()[-1]}")
+            return
+        if "already exists" in out:
+            rc2, url = run_cmd(
+                ["gh", "pr", "view", head, "--json", "url", "-q", ".url"], project)
+            print(f"   (a PR for {head} already exists){': ' + url if rc2 == 0 else ''}")
+            return
+        print(f"gh pr create failed:\n{out}\n   (falling back to a compare link)")
+    if slug:
+        print("→ open a PR here:\n"
+              f"   https://github.com/{slug}/compare/{base}...{head}?expand=1")
+    else:
+        print(f"→ open a PR for branch '{head}' into '{base}' on your repo.")
 
 
 def ensure_gitignore(project: Path, entries: list[str]) -> None:
@@ -484,24 +536,36 @@ def ensure_gitignore(project: Path, entries: list[str]) -> None:
 
 
 def publish(project: Path, idea: str) -> None:
-    """Commit the project and push to its configured GitHub repo (if any)."""
+    """Commit the build onto a feature branch and open a PR into the base branch.
+
+    We never push app work straight to the base branch (e.g. main):
+
+      • Empty remote → one-time bootstrap: the base branch is created and pushed
+        so there is something for later PRs to target.
+      • Otherwise    → the build is committed on a fresh `aegon/<topic>-<ts>`
+        branch, pushed, and a PR into the base branch is opened (via the gh CLI,
+        or a compare URL is printed as a fallback).
+
+    Simplification: the feature branch is cut from the current working tree, so a
+    run is assumed to start from a reasonably up-to-date base.
+    """
     cfg = load_config(project)
     repo = cfg.get("github_repo")
     if not repo:
-        print(f"\nno GitHub repo configured — skipping push.")
+        print("\nno GitHub repo configured — skipping publish.")
         print(f"   (add \"github_repo\" to {config_path(project)} to enable it)")
         return
 
-    decision, _ = checkpoint(f"Push this project to {repo} ?")
-    if decision != "approve":
-        print("skipped push.")
-        return
+    base = cfg.get("branch", "main")
 
-    branch = cfg.get("branch", "main")
+    decision, _ = checkpoint(f"Commit this build and open a PR on {repo} ?")
+    if decision != "approve":
+        print("skipped publishing.")
+        return
 
     if not (project / ".git").exists():
         run_git(["init"], project)
-        run_git(["branch", "-M", branch], project)
+        run_git(["branch", "-M", base], project)
 
     # keep harness-only files out of the app's repo
     ensure_gitignore(project, ["aegon.json", "run.json"])
@@ -510,16 +574,42 @@ def publish(project: Path, idea: str) -> None:
     rc, _ = run_git(["remote", "get-url", "origin"], project)
     run_git(["remote", "set-url" if rc == 0 else "add", "origin", repo], project)
 
+    # --- Bootstrap an empty remote: create the base branch once --------------
+    if remote_is_empty(project):
+        print(f"\n(new repo — initializing '{base}' on {repo})")
+        run_git(["checkout", base], project)  # best-effort; we created it above
+        run_git(["add", "-A"], project)
+        default_msg = f"Aegon: initialize {project.name}"
+        msg = ask(f'Commit message [{default_msg}]: ') or default_msg
+        rc, out = run_git(["commit", "-m", msg], project)
+        if rc != 0 and "nothing to commit" in out:
+            print("nothing to commit.")
+        print(f"pushing initial '{base}'…")
+        rc, out = run_git(["push", "-u", "origin", base], project)
+        print(f"✓ initialized {repo} ({base}). Future builds will open PRs."
+              if rc == 0 else f"push failed:\n{out}")
+        return
+
+    # --- Normal path: feature branch + pull request --------------------------
+    head = make_branch_name(project, idea)
+    run_git(["checkout", "-b", head], project)
     run_git(["add", "-A"], project)
     default_msg = f"Aegon: build {project.name}"
     msg = ask(f'Commit message [{default_msg}]: ') or default_msg
     rc, out = run_git(["commit", "-m", msg], project)
     if rc != 0 and "nothing to commit" in out:
-        print("nothing new to commit.")
+        print("nothing new to commit — skipping PR.")
+        run_git(["checkout", base], project)
+        return
 
-    print(f"pushing to {repo} ({branch})…")
-    rc, out = run_git(["push", "-u", "origin", branch], project)
-    print(f"✓ pushed to {repo} ({branch})." if rc == 0 else f"push failed:\n{out}")
+    print(f"pushing branch '{head}'…")
+    rc, out = run_git(["push", "-u", "origin", head], project)
+    if rc != 0:
+        print(f"push failed:\n{out}")
+        return
+
+    body = f"Built by Aegon.\n\nTask: {idea}\n" if idea else "Built by Aegon.\n"
+    open_pull_request(project, repo, base, head, msg, body)
 
 
 # --- the human checkpoint --------------------------------------------------
