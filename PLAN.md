@@ -2,6 +2,11 @@
 
 A learning project: a harness that takes a single prompt and orchestrates several
 focused agents to produce a working application on disk.
+
+Status: **phases 1–3 done; 4–5 partial** (tester + fix loop built, Reviewer and
+per-role models outstanding — tracked in the "Harness hardening" milestone).
+Date: 2026-11-07 · updated 2026-11-10.
+
 ---
 
 ## Decisions locked in
@@ -88,6 +93,11 @@ Start with phases 1–2, then grow.
 
 ## Open items / TODO
 
-- [ ] Confirm API access (`ANTHROPIC_API_KEY` or `ant auth login`).
-- [ ] Set up project: venv + `pip install claude-agent-sdk`.
-- [ ] Build phase 1.
+- [x] Confirm API access (authenticates through the logged-in Claude Code CLI).
+- [x] Set up project: venv + `pip install claude-agent-sdk`.
+- [x] Build phase 1.
+- [x] Build phases 2–3 (scaffolder, checkpoints, project selection, resume).
+- [x] Phase 4: tester + fix loop. (Reviewer still outstanding — see milestone.)
+- [x] Phase 5: `run.json` log + cost tracking. (Per-role models outstanding — see milestone.)
+
+Remaining work is tracked as GitHub issues under the **Harness hardening** milestone.
