@@ -2,9 +2,6 @@
 
 A learning project: a harness that takes a single prompt and orchestrates several
 focused agents to produce a working application on disk.
-
-Status: **planning**. Date: 2026-11-07.
-
 ---
 
 ## Decisions locked in
