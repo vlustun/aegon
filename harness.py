@@ -11,6 +11,11 @@ EXISTING one:
   • Existing → it lists projects/, you pick one and say what to work on next;
                the agents can read the current files and build on top of them.
 
+Plans are per-task. The first build keeps its plan as the canonical build plan
+(progress.md). Each later task on an existing project gets its own plan under
+plans/<slug>-<timestamp>.md, so earlier plans are never overwritten. When you
+continue an existing project you can resume any unfinished plan or start a new one.
+
 Then it runs a staged, checkpointed pipeline where your Python code is the
 orchestrator:
 
@@ -82,11 +87,12 @@ SCAFFOLDER_SYSTEM = (
     "Read the relevant files and preserve what's there; add or modify rather than "
     "overwrite wholesale. Keep files small and focused. Ensure a README with run "
     "instructions exists.\n\n"
-    "PROGRESS TRACKING: the project contains a progress.md whose '## Tasks' "
-    "section lists tasks as checkboxes. Work through the UNCHECKED ('- [ ]') tasks "
-    "in order. Immediately after you actually finish a task, use the Edit tool to "
-    "change that exact line's '- [ ]' to '- [x]' in progress.md. Only check a task "
-    "once its work is genuinely done. Never uncheck an already-checked task.\n\n"
+    "PROGRESS TRACKING: the task names a plan checklist file (a Markdown file with "
+    "a '## Tasks' section of checkboxes). Work through its UNCHECKED ('- [ ]') "
+    "tasks in order. Immediately after you actually finish a task, use the Edit "
+    "tool to change that exact line's '- [ ]' to '- [x]' in that same plan file. "
+    "Only check a task once its work is genuinely done. Never uncheck an "
+    "already-checked task.\n\n"
     "When done, report the list of files you created or changed, one per line."
 )
 
@@ -158,20 +164,7 @@ def choose_project(idea_arg: str) -> tuple[Path, str, bool]:
     if mode == "e":
         print("\nExisting projects:")
         for i, name in enumerate(existing, 1):
-            progress_md = PROJECTS_DIR / name / "progress.md"
-            if not progress_md.exists():
-                status = "no plan"
-            else:
-                done, total = plan_progress(progress_md)
-                if total == 0:
-                    status = "no tasks"
-                elif done == 0:
-                    status = f"0/{total} tasks  (not started)"
-                elif done >= total:
-                    status = f"{done}/{total} tasks  (complete)"
-                else:
-                    status = f"{done}/{total} tasks"
-            print(f"  {i}) {name:<20} {status}")
+            print(f"  {i}) {name:<20} {project_status(PROJECTS_DIR / name)}")
         while True:
             pick = ask("Pick a number: ")
             if pick.isdigit() and 1 <= int(pick) <= len(existing):
@@ -311,12 +304,13 @@ def tasks_from_md(progress_md: Path) -> list[tuple[str, bool]]:
     return tasks
 
 
-def write_plan_html(data: dict, project: Path, idea: str,
+def write_plan_html(data: dict, out_path: Path, idea: str,
                     progress_md: Path | None = None) -> Path:
     """Render the plan as a self-contained, styled HTML file with task checkboxes.
 
-    Task checked-state is read from progress.md when available (so the HTML can
-    be refreshed after scaffolding to show progress); otherwise all unchecked.
+    `out_path` is the .html file to write. Task checked-state is read from
+    `progress_md` when available (so the HTML can be refreshed after scaffolding
+    to show progress); otherwise all unchecked.
     """
     esc = html.escape
 
@@ -373,9 +367,9 @@ def write_plan_html(data: dict, project: Path, idea: str,
 <ul class="tasks">{task_items}</ul></section>
 </body></html>"""
 
-    path = project / "plan.html"
-    path.write_text(doc, encoding="utf-8")
-    return path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(doc, encoding="utf-8")
+    return out_path
 
 
 def open_in_browser(path: Path) -> bool:
@@ -395,10 +389,11 @@ def open_in_browser(path: Path) -> bool:
         return False
 
 
-def write_progress_md(data: dict, project: Path, idea: str) -> Path:
-    """Write progress.md with tasks as checkboxes, for live progress + resuming."""
+def write_progress_md(data: dict, out_path: Path, idea: str,
+                      title: str = "Build Plan") -> Path:
+    """Write a checkbox plan file (`out_path`) for live progress + resuming."""
     idea_line = " ".join(idea.splitlines())
-    lines = ["# Build Plan", "", f"> {idea_line}", "",
+    lines = [f"# {title}", "", f"> {idea_line}", "",
              f"**Stack:** {data.get('stack', '—')}", "", "## Files", ""]
     for f in data.get("files") or []:
         if isinstance(f, dict):
@@ -409,9 +404,9 @@ def write_progress_md(data: dict, project: Path, idea: str) -> Path:
     for step in data.get("steps") or []:
         lines.append(f"- [ ] {step}")
     lines.append("")
-    path = project / "progress.md"
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
 
 
 def extract_tasks(text: str) -> list[str]:
@@ -424,26 +419,98 @@ def extract_tasks(text: str) -> list[str]:
     return tasks
 
 
-def write_progress_md_fallback(raw: str, project: Path, idea: str) -> Path:
-    """Write progress.md from unparseable planner output, so a run is still
-    resumable. Any bullet/numbered lines become checkboxes."""
+def write_progress_md_fallback(raw: str, out_path: Path, idea: str,
+                               title: str = "Build Plan") -> Path:
+    """Write a plan file (`out_path`) from unparseable planner output, so a run is
+    still resumable. Any bullet/numbered lines become checkboxes."""
     idea_line = " ".join(idea.splitlines())
     tasks = extract_tasks(raw) or ["Complete the plan described above"]
-    lines = ["# Build Plan", "", f"> {idea_line}", "", "## Plan", "",
+    lines = [f"# {title}", "", f"> {idea_line}", "", "## Plan", "",
              raw.strip(), "", "## Tasks", ""]
     lines += [f"- [ ] {t}" for t in tasks]
     lines.append("")
-    path = project / "progress.md"
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
 
 
 def plan_progress(plan_md: Path) -> tuple[int, int]:
-    """Count (checked, total) task checkboxes in progress.md."""
+    """Count (checked, total) task checkboxes in a plan file."""
     text = plan_md.read_text(encoding="utf-8")
     done = len(re.findall(r"- \[x\]", text, flags=re.IGNORECASE))
     todo = len(re.findall(r"- \[ \]", text))
     return done, done + todo
+
+
+# --- plan files: one build plan + per-task plans ---------------------------
+def build_plan_path(project: Path) -> Path:
+    """The canonical build plan (kept at the project root for back-compat)."""
+    return project / "progress.md"
+
+
+def plans_dir(project: Path) -> Path:
+    return project / "plans"
+
+
+def list_task_plans(project: Path) -> list[Path]:
+    """Per-task plans, newest first."""
+    d = plans_dir(project)
+    return sorted(d.glob("*.md"), reverse=True) if d.is_dir() else []
+
+
+def all_plans(project: Path) -> list[Path]:
+    """The build plan (if any) followed by every per-task plan."""
+    plans: list[Path] = []
+    bp = build_plan_path(project)
+    if bp.exists():
+        plans.append(bp)
+    plans.extend(list_task_plans(project))
+    return plans
+
+
+def plan_label(plan_path: Path, project: Path) -> str:
+    """Human-readable name for a plan file in listings."""
+    if plan_path == build_plan_path(project):
+        return "build plan"
+    return plan_path.stem
+
+
+def new_task_plan_path(project: Path, idea: str) -> Path:
+    """A fresh per-task plan file: plans/<slug>-<timestamp>.md."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    slug = slugify(idea) if idea else "task"
+    return plans_dir(project) / f"{slug}-{stamp}.md"
+
+
+def html_for(plan_path: Path, project: Path) -> Path:
+    """The .html render path for a plan file.
+
+    The build plan keeps the historical `plan.html` name; a per-task plan gets an
+    .html sibling next to it.
+    """
+    if plan_path == build_plan_path(project):
+        return project / "plan.html"
+    return plan_path.with_suffix(".html")
+
+
+def project_status(project: Path) -> str:
+    """One-line status for the project picker: build-plan progress + task count."""
+    tasks_n = len(list_task_plans(project))
+    extra = (f"  (+{tasks_n} task plan{'s' if tasks_n != 1 else ''})"
+             if tasks_n else "")
+    bp = build_plan_path(project)
+    if not bp.exists():
+        return "no plan" if not tasks_n else f"no build plan{extra}"
+    done, total = plan_progress(bp)
+    if total == 0:
+        base = "no tasks"
+    elif done == 0:
+        base = f"build 0/{total}  (not started)"
+    elif done >= total:
+        base = f"build {done}/{total}  (complete)"
+    else:
+        base = f"build {done}/{total}"
+    return base + extra
 
 
 # --- per-project config + git/github --------------------------------------
@@ -701,41 +768,73 @@ async def run(idea_arg: str) -> None:
     kind = "new project" if is_new else "existing project"
 
     total_cost = 0.0
-    progress_md = project / "progress.md"
     plan_data: dict | None = None
 
-    # --- Resume? existing project with an unfinished progress.md -----------
+    # --- Choose the plan file for this run ---------------------------------
+    # The build plan (progress.md) is canonical and never overwritten by a task.
+    # Each new task on an existing project gets its own plans/<slug>-<ts>.md, so
+    # the original build plan and earlier task plans stay intact.
+    user_plan_md = project / "plan.md"
     resume = False
-    if not is_new and progress_md.exists() and "- [ ]" in progress_md.read_text(encoding="utf-8"):
-        done, total = plan_progress(progress_md)
-        print(f"\nfound an existing plan — {done}/{total} tasks done.")
-        resume = ask("Resume it or make a new plan? [r]esume / [n]ew: ").lower()[:1] != "n"
+    plan_path: Path | None = None
 
-    # For an existing project we deferred asking what to work on until after the
-    # resume question: a fresh plan needs an instruction, a resume does not.
-    if not is_new and not resume and not idea:
-        idea = read_multiline(f"What should we work on in '{project.name}'?")
+    if is_new:
+        plan_path = build_plan_path(project)          # the canonical build plan
+    else:
+        unfinished = [p for p in all_plans(project)
+                      if "- [ ]" in p.read_text(encoding="utf-8")]
+        if unfinished:
+            print("\nUnfinished plans:")
+            for i, p in enumerate(unfinished, 1):
+                done, total = plan_progress(p)
+                print(f"  {i}) {plan_label(p, project):<28} {done}/{total} tasks")
+            print("  n) start a new task plan")
+            while True:
+                pick = ask("Resume which? [number] / [n]ew: ").lower()
+                if pick[:1] == "n":
+                    break
+                if pick.isdigit() and 1 <= int(pick) <= len(unfinished):
+                    plan_path = unfinished[int(pick) - 1]
+                    resume = True
+                    break
+                print("   (enter a valid number or 'n')")
+        # else: nothing to resume → a new task plan (path set once we have idea).
+
+    # A fresh task needs an instruction; a resume does not.
+    if not resume and not idea:
+        prompt = ("Describe the app you want to build:" if is_new
+                  else f"What should we work on in '{project.name}'?")
+        idea = read_multiline(prompt)
+
+    # Finalize a new-task plan path now that the idea is known.
+    if plan_path is None:
+        plan_path = new_task_plan_path(project, idea)
+
+    is_build_plan = plan_path == build_plan_path(project)
+    plan_title = "Build Plan" if is_build_plan else "Task Plan"
+    html_path = html_for(plan_path, project)
+    rel_plan = plan_path.relative_to(project)
 
     print(f"\n{kind}: {project}/")
     if idea:
         print(f"→ task: {idea!r}")
+    print(f"→ plan file: {rel_plan}")
 
-    # A plan.md you placed in the project folder is treated as YOUR plan: the
-    # planner is skipped and this file is never overwritten. (progress.md, the
-    # harness's working checklist, is derived from it so tasks can be ticked.)
-    user_plan_md = project / "plan.md"
-
+    # --- Stage 1: PLAN (or resume / use a user-supplied plan) --------------
     if resume:
-        plan = progress_md.read_text(encoding="utf-8")
-        print("resuming progress.md (continuing the unchecked tasks)")
-    elif user_plan_md.exists():
+        plan = plan_path.read_text(encoding="utf-8")
+        print(f"resuming {rel_plan} (continuing the unchecked tasks)")
+    elif is_build_plan and user_plan_md.exists():
+        # A plan.md you placed in the project is treated as YOUR build plan: the
+        # planner is skipped and plan.md is never overwritten; the checkbox file
+        # is derived from it so tasks can be ticked.
         plan = user_plan_md.read_text(encoding="utf-8")
         print(f"using your {user_plan_md} as the plan (it will not be overwritten)")
-        if not progress_md.exists():
-            write_progress_md_fallback(plan, project, idea)
-            print(f"   (created {progress_md} to track task progress)")
+        if not plan_path.exists():
+            write_progress_md_fallback(plan, plan_path, idea, title=plan_title)
+            print(f"   (created {rel_plan} to track task progress)")
         else:
-            print(f"   (keeping existing {progress_md} for progress tracking)")
+            print(f"   (keeping existing {rel_plan} for progress tracking)")
     else:
         context = "" if is_new else (
             "\nThis is an EXISTING project; read its current files before planning."
@@ -745,7 +844,6 @@ async def run(idea_arg: str) -> None:
         # files, not guesswork. A new project has nothing to read yet.
         planner_tools = [] if is_new else ["Read", "Glob", "Grep"]
         planner_cwd = None if is_new else str(project)
-        # --- Stage 1: PLAN (with optional revise loop) ---------------------
         plan_prompt = f"App / task: {idea}{context}"
         while True:
             plan, cost = await run_agent(
@@ -755,22 +853,22 @@ async def run(idea_arg: str) -> None:
             )
             total_cost += cost
             plan_data = parse_plan(plan)
-            # Write the checkbox progress.md right now, during planning, so it
-            # always exists (structured if the JSON parsed, else from raw text).
+            # Write the checkbox plan file now, during planning, so it always
+            # exists (structured if the JSON parsed, else from raw text).
             if plan_data:
-                write_progress_md(plan_data, project, idea)
+                write_progress_md(plan_data, plan_path, idea, title=plan_title)
                 render_plan(plan_data)               # quick glance in the terminal
-                html_path = write_plan_html(plan_data, project, idea, progress_md)
+                html_path = write_plan_html(plan_data, html_path, idea, plan_path)
                 opened = open_in_browser(html_path)
-                print(f"\n   plan: {progress_md}  ·  {html_path}"
+                print(f"\n   plan: {rel_plan}  ·  {html_path.name}"
                       + ("  (opened)" if opened else ""))
             else:
-                write_progress_md_fallback(plan, project, idea)
+                write_progress_md_fallback(plan, plan_path, idea, title=plan_title)
                 print(plan)
-                print(f"\n   plan: {progress_md}")
+                print(f"\n   plan: {rel_plan}")
             decision, feedback = checkpoint("Accept this plan?", allow_revise=True)
             if decision == "quit":
-                print("\naborted at plan stage. (progress.md was written)")
+                print(f"\naborted at plan stage. ({rel_plan} was written)")
                 return
             if decision == "approve":
                 break
@@ -780,13 +878,14 @@ async def run(idea_arg: str) -> None:
             )
 
         # Hand the checkbox file to the scaffolder to tick off.
-        plan = progress_md.read_text(encoding="utf-8")
+        plan = plan_path.read_text(encoding="utf-8")
 
     # --- Stage 2: SCAFFOLD -------------------------------------------------
     scaffold_prompt = (
-        f"App / task: {idea}\n\nBuild plan (tasks are the checkboxes in progress.md):\n"
-        f"{plan}\n\nWork through the unchecked tasks now, creating or updating the "
-        "files, and tick each task off in progress.md as you complete it."
+        f"App / task: {idea}\n\nPlan checklist file: {rel_plan}\n"
+        f"Plan contents:\n{plan}\n\nWork through the unchecked ('- [ ]') tasks now, "
+        f"creating or updating the files, and tick each task off in {rel_plan} as "
+        "you complete it."
     )
     report, cost = await run_agent(
         label="scaffolder", system=SCAFFOLDER_SYSTEM, prompt=scaffold_prompt,
@@ -796,12 +895,12 @@ async def run(idea_arg: str) -> None:
     )
     total_cost += cost
 
-    if progress_md.exists():
-        done, total = plan_progress(progress_md)
-        print(f"\n   progress: {done}/{total} tasks checked in {progress_md}")
-        # Refresh plan.html so its checkboxes reflect the scaffolder's progress.
+    if plan_path.exists():
+        done, total = plan_progress(plan_path)
+        print(f"\n   progress: {done}/{total} tasks checked in {rel_plan}")
+        # Refresh the plan HTML so its checkboxes reflect the scaffolder's progress.
         if plan_data:
-            write_plan_html(plan_data, project, idea, progress_md)
+            write_plan_html(plan_data, html_path, idea, plan_path)
 
     # --- Stage 3: TEST + FIX ----------------------------------------------
     test_result, tcost = await test_and_fix(project, idea)
@@ -813,9 +912,9 @@ async def run(idea_arg: str) -> None:
     # --- Wrap up -----------------------------------------------------------
     (project / "run.json").write_text(
         json.dumps(
-            {"idea": idea, "is_new": is_new, "plan": plan,
-             "scaffold_report": report, "test_result": test_result,
-             "kept": kept, "cost_usd": total_cost},
+            {"idea": idea, "is_new": is_new, "plan_file": str(rel_plan),
+             "resumed": resume, "plan": plan, "scaffold_report": report,
+             "test_result": test_result, "kept": kept, "cost_usd": total_cost},
             indent=2,
         )
     )
