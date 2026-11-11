@@ -68,8 +68,8 @@ Fine for a local tool.
 |---|---|---|
 | Models | Opus for Orchestrator/Planner, Sonnet for Coder/Tester, Haiku for simple steps | Match cost to difficulty |
 | Checkpoints | Pause after **plan**, after **code written**, before **destructive/install** steps | Safe, debuggable |
-| Workspace | Each run gets its own dir: `runs/<timestamp>/` | Isolation; easy to inspect or discard |
-| State | Write `run.json` logging every step + agent output | See *why* it did what it did |
+| Workspace | Each project gets its own dir: `projects/<name>/`; each task a plan `plans/<slug>-<timestamp>.md` | Isolation; inspectable; many tasks per project |
+| State | Write `run.json` (summary of the last run: plan, scaffold, test result, cost) at the end | See *why* it did what it did |
 | Permissions | Bash gated behind approval at first | Watch what it runs while learning |
 
 Model IDs: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`.
