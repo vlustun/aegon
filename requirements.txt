@@ -1,2 +1,3 @@
 claude-agent-sdk>=0.2.179
 anthropic-cli
+pytest>=8.0

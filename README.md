@@ -88,4 +88,46 @@ Models
 
 Every role currently runs on one model to keep learning runs cheap; the per-role model split (Opus to plan, Sonnet to build) is described in the plan but not yet wired in.
 
-Source: harness.py · README.md · PLAN.md · a learning project built on the Claude Agent SDK
+---
+
+## Code layout
+
+The harness was refactored into an `aegon/` package following a ports-and-adapters
+(hexagonal) architecture, so the core logic no longer depends on the terminal,
+the SDK, or git directly:
+
+```
+aegon/
+  config.py         Settings (models, prompts, limits) — injected, not global
+  domain/           pure value objects + logic (Plan, Task, parsing) — no I/O
+  ports/            abstractions the core depends on (UserInterface, AgentRunner,
+                    VersionControl) as typing.Protocols  — the DIP seam
+  adapters/         concrete ports: console UI, Claude Agent SDK runner, git/gh
+  agents/           AgentRole specs + factory (per-role prompt/model/tools)
+  rendering/        plan renderers: markdown, html, terminal
+  persistence/      repositories: plan files, project config, run log
+  services/         project selection + publishing
+  pipeline/         Stage abstraction + stages + the orchestrator (Facade)
+  __main__.py       composition root — wires adapters into the orchestrator
+harness.py          thin back-compat shim (old entry point + public functions)
+tests/              pytest: pure-logic, repositories, and a fake-driven full run
+```
+
+Patterns used: **Ports & Adapters / DIP** (swap the SDK or terminal for fakes in
+tests), **Strategy** (`AgentRole`, plan renderers, pipeline `Stage`), **Factory**
+(`AgentRoleFactory`), **Repository** (plan/config access), and a **Pipeline +
+Facade** (ordered stages behind a thin `Orchestrator`). Adding the planned
+Reviewer stage is now a new `Stage` appended to the list — no existing code
+changes (OCP).
+
+Run it:
+
+```
+python -m aegon                       # or: python harness.py
+python -m aegon "a CLI todo app"      # pre-fill the idea
+python -m pytest                      # run the test suite
+```
+
+---
+
+Source: aegon/ · harness.py · README.md · PLAN.md · a learning project built on the Claude Agent SDK
