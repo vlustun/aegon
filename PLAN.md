@@ -3,9 +3,9 @@
 A learning project: a harness that takes a single prompt and orchestrates several
 focused agents to produce a working application on disk.
 
-Status: **phases 1–3 done; 4–5 partial** (tester + fix loop built, Reviewer and
-per-role models outstanding — tracked in the "Harness hardening" milestone).
-Date: 2026-11-07 · updated 2026-11-10.
+Status: **phases 1–3 done; 4–5 partial** (tester + fix loop and per-role models
+built, Reviewer outstanding — tracked in the "Harness hardening" milestone).
+Date: 2026-11-07 · updated 2026-11-20.
 
 ---
 
@@ -66,7 +66,7 @@ Fine for a local tool.
 
 | Area | Default | Why |
 |---|---|---|
-| Models | Opus for Orchestrator/Planner, Sonnet for Coder/Tester, Haiku for simple steps | Match cost to difficulty |
+| Models | Opus for Planner, Sonnet for Scaffolder/Tester/Fixer; overridable per role in `aegon.json` (`"models"`), Haiku for cheap roles | Match cost to difficulty |
 | Checkpoints | Pause after **plan**, after **code written**, before **destructive/install** steps | Safe, debuggable |
 | Workspace | Each project gets its own dir: `projects/<name>/`; each task a plan `plans/<slug>-<timestamp>.md` | Isolation; inspectable; many tasks per project |
 | State | Write `run.json` (summary of the last run: plan, scaffold, test result, cost) at the end | See *why* it did what it did |
@@ -98,6 +98,6 @@ Start with phases 1–2, then grow.
 - [x] Build phase 1.
 - [x] Build phases 2–3 (scaffolder, checkpoints, project selection, resume).
 - [x] Phase 4: tester + fix loop. (Reviewer still outstanding — see milestone.)
-- [x] Phase 5: `run.json` log + cost tracking. (Per-role models outstanding — see milestone.)
+- [x] Phase 5: `run.json` log + cost tracking + per-role models (config → default, per-project `aegon.json` override).
 
 Remaining work is tracked as GitHub issues under the **Harness hardening** milestone.

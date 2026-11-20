@@ -29,7 +29,9 @@ def _build(tmp_path, ui, runner):
     roles = AgentRoleFactory(settings)
     selector = ProjectSelector(ui, settings, config_repo)
     publisher = Publisher(ui, FakeVCS(), config_repo, settings)
-    return Orchestrator(ui, runner, roles, settings, selector, publisher)
+    return Orchestrator(
+        ui, runner, roles, settings, selector, publisher, config_repo
+    )
 
 
 def test_new_project_full_run(tmp_path):
@@ -62,6 +64,30 @@ def test_new_project_full_run(tmp_path):
     progress = (project / "progress.md").read_text()
     assert "- [ ] scaffold app" in progress
     assert "- [ ] add tests" in progress
+
+
+def test_project_aegon_json_overrides_role_models(tmp_path):
+    # An existing project whose aegon.json pins per-role models.
+    project = tmp_path / "projects" / "demo"
+    project.mkdir(parents=True)
+    ProjectConfigRepository().save(
+        project, {"branch": "main", "models": {"planner": "sonnet", "fixer": "haiku"}}
+    )
+
+    ui = FakeUI(
+        answers=["e", "1"],  # existing project, pick #1
+        decisions=[Decision.APPROVE, Decision.QUIT, Decision.APPROVE],
+    )
+    runner = FakeAgentRunner({"planner": PLAN_JSON, "scaffolder": "created app.py"})
+    orch = _build(tmp_path, ui, runner)
+
+    asyncio.run(orch.run("add a feature"))
+
+    # planner overridden to sonnet; scaffolder keeps the default sonnet
+    assert runner.models["planner"] == "claude-sonnet-5-5"
+    assert runner.models["scaffolder"] == "claude-sonnet-5-5"
+    # the override line is surfaced to the user
+    assert any("models (from aegon.json)" in m for m in ui.messages)
 
 
 def test_quit_at_plan_aborts(tmp_path):

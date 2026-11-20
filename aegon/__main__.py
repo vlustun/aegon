@@ -42,7 +42,9 @@ def build_orchestrator(settings: Settings | None = None) -> Orchestrator:
     vcs = GitVersionControl(ui)
     selector = ProjectSelector(ui, settings, config_repo)
     publisher = Publisher(ui, vcs, config_repo, settings)
-    return Orchestrator(ui, runner, roles, settings, selector, publisher)
+    return Orchestrator(
+        ui, runner, roles, settings, selector, publisher, config_repo
+    )
 
 
 def main() -> None:
