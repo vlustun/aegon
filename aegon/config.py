@@ -7,8 +7,33 @@ free of global state and makes per-role models trivial to vary in tests.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Mapping
+
+# --- per-role models ---------------------------------------------------------
+# Match cost to difficulty: the planner reasons over the whole task (Opus); the
+# builder/tester/fixer do more mechanical work (Sonnet); trivial roles can be
+# pointed at Haiku via config. These are the canonical model ids; the aliases
+# let an ``aegon.json`` say "opus"/"sonnet"/"haiku" instead of the full id.
+OPUS = "claude-opus-5-5"
+SONNET = "claude-sonnet-5-5"
+HAIKU = "claude-haiku-5-5"
+
+MODEL_ALIASES: dict[str, str] = {"opus": OPUS, "sonnet": SONNET, "haiku": HAIKU}
+
+# role name (as used in aegon.json's "models" table) -> Settings field it sets
+ROLE_MODEL_FIELDS: dict[str, str] = {
+    "planner": "planner_model",
+    "scaffolder": "scaffolder_model",
+    "tester": "tester_model",
+    "fixer": "fixer_model",
+}
+
+
+def resolve_model(value: str) -> str:
+    """Map a short alias ("opus") to its full id; pass a full id through."""
+    return MODEL_ALIASES.get(value.strip().lower(), value.strip())
 
 # --- agent system prompts (unchanged wording from the original harness) ------
 PLANNER_SYSTEM = (
@@ -68,10 +93,10 @@ class Settings:
 
     projects_dir: Path = Path("projects")
 
-    planner_model: str = "claude-sonnet-5-5"
-    scaffolder_model: str = "claude-sonnet-5-5"
-    tester_model: str = "claude-sonnet-5-5"
-    fixer_model: str = "claude-sonnet-5-5"
+    planner_model: str = OPUS
+    scaffolder_model: str = SONNET
+    tester_model: str = SONNET
+    fixer_model: str = SONNET
 
     max_fix_attempts: int = 3
 
@@ -82,3 +107,18 @@ class Settings:
 
     # files the harness keeps out of a built app's repo
     harness_only_files: tuple[str, ...] = ("aegon.json", "run.json")
+
+    def with_models(self, overrides: Mapping[str, str] | None) -> "Settings":
+        """Return a copy with per-role model overrides applied.
+
+        ``overrides`` is a project's ``aegon.json`` ``"models"`` table, e.g.
+        ``{"planner": "opus", "fixer": "haiku"}``. Unknown roles and blank
+        values are ignored, so a malformed config degrades to the defaults
+        rather than raising. The base settings are never mutated (frozen).
+        """
+        changes: dict[str, str] = {}
+        for role, value in (overrides or {}).items():
+            field_name = ROLE_MODEL_FIELDS.get(role)
+            if field_name and isinstance(value, str) and value.strip():
+                changes[field_name] = resolve_model(value)
+        return replace(self, **changes) if changes else self

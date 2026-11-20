@@ -49,9 +49,11 @@ class FakeAgentRunner:
     def __init__(self, outputs: dict[str, str]) -> None:
         self._outputs = outputs
         self.calls: list[tuple[str, str]] = []
+        self.models: dict[str, str] = {}  # role label prefix -> model used
 
     async def run(self, role: AgentRole, prompt: str, *, cwd=None) -> AgentResult:
         self.calls.append((role.label, prompt))
+        self.models[role.label.split(" ")[0]] = role.model
         for key, text in self._outputs.items():
             if role.label.startswith(key):
                 return AgentResult(text=text, cost_usd=0.01)

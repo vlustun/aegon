@@ -86,7 +86,27 @@ Rollback
 
 Models
 
-Every role currently runs on one model to keep learning runs cheap; the per-role model split (Opus to plan, Sonnet to build) is described in the plan but not yet wired in.
+Each role resolves its model from config → default, matching cost to difficulty.
+The defaults are **Opus for the planner** (it reasons over the whole task) and
+**Sonnet for the scaffolder, tester and fixer** (more mechanical work). Any role
+can be overridden per project in that project's `aegon.json`:
+
+```json
+{
+  "branch": "main",
+  "models": {
+    "planner": "opus",
+    "scaffolder": "sonnet",
+    "tester": "haiku",
+    "fixer": "haiku"
+  }
+}
+```
+
+Values may be short aliases (`opus` / `sonnet` / `haiku`) or full model ids
+(e.g. `claude-opus-5-5`). Unknown roles and blank values are ignored, so a
+partial or malformed `"models"` table simply falls back to the defaults. Point a
+cheap role like the tester or fixer at Haiku to keep simple runs inexpensive.
 
 ---
 

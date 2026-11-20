@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from aegon.agents.roles import AgentRoleFactory
-from aegon.config import Settings
+from aegon.config import ROLE_MODEL_FIELDS, Settings
 from aegon.persistence.plan_repository import PlanRepository
+from aegon.persistence.project_config import ProjectConfigRepository
 from aegon.pipeline.stage import PipelineAbort, RunContext
 from aegon.pipeline.stages import (
     PlanStage,
@@ -28,6 +29,7 @@ class Orchestrator:
         settings: Settings,
         selector: ProjectSelector,
         publisher: Publisher,
+        config_repo: ProjectConfigRepository,
     ) -> None:
         self._ui = ui
         self._runner = runner
@@ -35,16 +37,18 @@ class Orchestrator:
         self._settings = settings
         self._selector = selector
         self._publisher = publisher
+        self._config_repo = config_repo
 
     async def run(self, idea_arg: str) -> None:
         self._ui.notify("\n🜂  Aegon")
         selection = self._selector.choose(idea_arg)
+        settings, roles = self._resolve_models(selection)
         ctx, plan_repo = self._prepare(selection)
 
         stages = [
-            PlanStage(self._ui, self._runner, self._roles),
-            ScaffoldStage(self._ui, self._runner, self._roles, plan_repo),
-            TestFixStage(self._ui, self._runner, self._roles, self._settings),
+            PlanStage(self._ui, self._runner, roles),
+            ScaffoldStage(self._ui, self._runner, roles, plan_repo),
+            TestFixStage(self._ui, self._runner, roles, settings),
             WrapUpStage(self._ui),
             PublishStage(self._publisher),
         ]
@@ -59,6 +63,24 @@ class Orchestrator:
             f"done · ${ctx.total_cost:.4f} · project: {ctx.project}/"
             + ("" if ctx.kept else "  (you marked this run as not kept)")
         )
+
+    def _resolve_models(
+        self, selection: ProjectSelection
+    ) -> tuple[Settings, AgentRoleFactory]:
+        """Apply the project's per-role model overrides (aegon.json "models").
+
+        Defaults come from the injected Settings; a project can override any
+        role in its own aegon.json, so the model choice is config → default.
+        """
+        cfg = self._config_repo.load(selection.project)
+        settings = self._settings.with_models(cfg.get("models"))
+        if settings is not self._settings:
+            picks = ", ".join(
+                f"{role}={getattr(settings, field)}"
+                for role, field in sorted(ROLE_MODEL_FIELDS.items())
+            )
+            self._ui.notify(f"→ models (from aegon.json): {picks}")
+        return settings, AgentRoleFactory(settings)
 
     def _prepare(
         self, selection: ProjectSelection
